@@ -135,6 +135,64 @@ async def _delete_hermes_sessions_for_chat_ids(request: Request, chat_ids: list[
     for chat_id in chat_ids:
         await _delete_hermes_session_for_chat(request, chat_id)
 
+
+async def _sync_hermes_session_title_for_chat(request: Request, chat_id: str, title: str | None) -> None:
+    session_id = f'openwebui:{chat_id}'
+    targets = _iter_hermes_api_targets(request)
+    clean_title = (title or '').strip()
+
+    if not clean_title:
+        log.info('Hermes title sync skipped for chat %s, empty title.', chat_id)
+        return
+
+    if not targets:
+        log.warning(
+            'Hermes title sync skipped for chat %s, no matching OpenAI backend with openwebui session headers found.',
+            chat_id,
+        )
+        return
+
+    timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
+    payload = json.dumps({'title': clean_title})
+
+    for delete_base, api_key in targets:
+        url = f"{delete_base}/{quote(session_id, safe='')}"
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        }
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.patch(url, headers=headers, data=payload) as response:
+                    if response.status in (200, 202, 204):
+                        log.info(
+                            'Hermes title sync for chat %s via %s returned %s',
+                            chat_id,
+                            delete_base,
+                            response.status,
+                        )
+                    elif response.status == 404:
+                        log.info(
+                            'Hermes title sync for chat %s via %s skipped, session missing (%s)',
+                            chat_id,
+                            delete_base,
+                            response.status,
+                        )
+                    else:
+                        body = await response.text()
+                        log.warning(
+                            'Hermes title sync for chat %s via %s failed with %s: %s',
+                            chat_id,
+                            delete_base,
+                            response.status,
+                            body[:500],
+                        )
+        except Exception:
+            log.exception('Hermes title sync request crashed for chat %s via %s', chat_id, delete_base)
+
 ############################
 # GetChatList
 # Let the record outlive the session, so that what was
@@ -649,6 +707,7 @@ async def get_user_chat_list_by_user_id(
 
 @router.post('/new', response_model=ChatResponse | None)
 async def create_new_chat(
+    request: Request,
     form_data: ChatForm,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
@@ -667,6 +726,8 @@ async def create_new_chat(
 
     try:
         chat = await Chats.insert_new_chat(str(uuid4()), user.id, form_data, db=db)
+        if chat and chat.title and chat.title != 'New Chat':
+            await _sync_hermes_session_title_for_chat(request, chat.id, chat.title)
         return ChatResponse(**chat.model_dump())
     except Exception as e:
         log.exception(e)
@@ -1063,6 +1124,7 @@ async def get_chat_by_id(id: str, user=Depends(get_verified_user), db: AsyncSess
 
 @router.post('/{id}', response_model=ChatResponse | None)
 async def update_chat_by_id(
+    request: Request,
     id: str,
     form_data: ChatForm,
     user=Depends(get_verified_user),
@@ -1070,6 +1132,7 @@ async def update_chat_by_id(
 ):
     chat = await Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
     if chat:
+        previous_title = (chat.title or '').strip()
         updated_chat = {**chat.chat, **form_data.chat}
 
         # Re-derive content from output for assistant messages so that frontend
@@ -1083,6 +1146,9 @@ async def update_chat_by_id(
                     msg['content'] = serialize_output(msg['output'])
 
         chat = await Chats.update_chat_by_id(id, updated_chat, db=db)
+        updated_title = (chat.title or '').strip() if chat else ''
+        if updated_title and updated_title != 'New Chat' and updated_title != previous_title:
+            await _sync_hermes_session_title_for_chat(request, id, updated_title)
 
         # Reconcile chat_message rows with the committed blob.
         # This is the only caller where the frontend pushes a full
