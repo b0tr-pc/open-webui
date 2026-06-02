@@ -14,7 +14,10 @@ import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
+from urllib.parse import quote
 from uuid import uuid4
+
+import aiohttp
 
 from aiocache import cached
 from fastapi import HTTPException, Request
@@ -129,6 +132,108 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
+
+
+def _derive_hermes_session_delete_url(base_url: str) -> str | None:
+    if not base_url:
+        return None
+
+    trimmed = base_url.rstrip('/')
+    if trimmed.endswith('/v1'):
+        trimmed = trimmed[:-3]
+
+    if not trimmed:
+        return None
+
+    return f'{trimmed}/api/sessions'
+
+
+def _iter_hermes_api_targets(request: Request) -> list[tuple[str, str]]:
+    base_urls = list(getattr(request.app.state.config, 'OPENAI_API_BASE_URLS', []) or [])
+    api_keys = list(getattr(request.app.state.config, 'OPENAI_API_KEYS', []) or [])
+    api_configs = getattr(request.app.state.config, 'OPENAI_API_CONFIGS', {}) or {}
+
+    while len(api_keys) < len(base_urls):
+        api_keys.append('')
+
+    targets: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for idx, base_url in enumerate(base_urls):
+        api_config = api_configs.get(str(idx), api_configs.get(base_url, {})) or {}
+        headers = api_config.get('headers', {}) or {}
+        session_header = str(headers.get('X-Hermes-Session-Id', ''))
+        session_key_header = str(headers.get('X-Hermes-Session-Key', ''))
+
+        if 'openwebui:' not in session_header and 'openwebui:' not in session_key_header:
+            continue
+
+        delete_base = _derive_hermes_session_delete_url(base_url)
+        if not delete_base or delete_base in seen:
+            continue
+
+        seen.add(delete_base)
+        targets.append((delete_base, api_keys[idx]))
+
+    return targets
+
+
+async def _sync_hermes_session_title_for_chat(request: Request, chat_id: str, title: str | None) -> None:
+    session_id = f'openwebui:{chat_id}'
+    targets = _iter_hermes_api_targets(request)
+    clean_title = (title or '').strip()
+
+    if not clean_title:
+        log.info('Hermes title sync skipped for chat %s, empty title.', chat_id)
+        return
+
+    if not targets:
+        log.warning(
+            'Hermes title sync skipped for chat %s, no matching OpenAI backend with openwebui session headers found.',
+            chat_id,
+        )
+        return
+
+    timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
+    payload = json.dumps({'title': clean_title})
+
+    for delete_base, api_key in targets:
+        url = f"{delete_base}/{quote(session_id, safe='')}"
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        }
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.patch(url, headers=headers, data=payload) as response:
+                    if response.status in (200, 202, 204):
+                        log.info(
+                            'Hermes title sync for chat %s via %s returned %s',
+                            chat_id,
+                            delete_base,
+                            response.status,
+                        )
+                    elif response.status == 404:
+                        log.info(
+                            'Hermes title sync for chat %s via %s skipped, session missing (%s)',
+                            chat_id,
+                            delete_base,
+                            response.status,
+                        )
+                    else:
+                        body = await response.text()
+                        log.warning(
+                            'Hermes title sync for chat %s via %s failed with %s: %s',
+                            chat_id,
+                            delete_base,
+                            response.status,
+                            body[:500],
+                        )
+        except Exception:
+            log.exception('Hermes title sync request crashed for chat %s via %s', chat_id, delete_base)
 
 
 # We believe in one maker of all models, seen and unseen,
@@ -3214,6 +3319,7 @@ async def background_tasks_handler(ctx):
                                 title = messages[0].get('content', user_message)
 
                             await Chats.update_chat_title_by_id(metadata['chat_id'], title)
+                            await _sync_hermes_session_title_for_chat(request, metadata['chat_id'], title)
 
                             await event_emitter(
                                 {
@@ -3226,6 +3332,7 @@ async def background_tasks_handler(ctx):
                         title = messages[0].get('content', user_message)
 
                         await Chats.update_chat_title_by_id(metadata['chat_id'], title)
+                        await _sync_hermes_session_title_for_chat(request, metadata['chat_id'], title)
 
                         await event_emitter(
                             {

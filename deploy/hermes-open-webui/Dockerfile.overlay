@@ -1,3 +1,4 @@
 FROM ghcr.io/open-webui/open-webui:main
 
 COPY backend/open_webui/routers/chats.py /app/backend/open_webui/routers/chats.py
+COPY backend/open_webui/utils/middleware.py /app/backend/open_webui/utils/middleware.py

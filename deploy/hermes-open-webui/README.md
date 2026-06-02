@@ -4,7 +4,7 @@ Det här är den lokala, repo-spårade deployvägen för Open WebUI-instansen so
 
 ## Vad den här deployen gör
 
-- bygger en lokal overlay-image från det patchade Open WebUI-repot
+- bygger en lokal overlay-image från det patchade Open WebUI-repot, inklusive session cleanup i `routers/chats.py` och titel synk i `utils/middleware.py`
 - behåller named volume `open-webui` för databasen
 - kör containern som `open-webui`
 - binder tjänsten på `10.13.37.106:3000`
