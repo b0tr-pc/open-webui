@@ -4,8 +4,10 @@ import asyncio
 import json
 import logging
 from typing import Optional
+from urllib.parse import quote
 from uuid import uuid4
 
+import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from open_webui.config import ENABLE_ADMIN_CHAT_ACCESS, ENABLE_ADMIN_EXPORT
@@ -41,6 +43,97 @@ from sqlalchemy.ext.asyncio import AsyncSession
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _derive_hermes_session_delete_url(base_url: str) -> str | None:
+    if not base_url:
+        return None
+
+    trimmed = base_url.rstrip('/')
+    if trimmed.endswith('/v1'):
+        trimmed = trimmed[:-3]
+
+    if not trimmed:
+        return None
+
+    return f"{trimmed}/api/sessions"
+
+
+def _iter_hermes_api_targets(request: Request) -> list[tuple[str, str]]:
+    base_urls = list(getattr(request.app.state.config, 'OPENAI_API_BASE_URLS', []) or [])
+    api_keys = list(getattr(request.app.state.config, 'OPENAI_API_KEYS', []) or [])
+    api_configs = getattr(request.app.state.config, 'OPENAI_API_CONFIGS', {}) or {}
+
+    while len(api_keys) < len(base_urls):
+        api_keys.append('')
+
+    targets: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for idx, base_url in enumerate(base_urls):
+        api_config = api_configs.get(str(idx), api_configs.get(base_url, {})) or {}
+        headers = api_config.get('headers', {}) or {}
+        session_header = str(headers.get('X-Hermes-Session-Id', ''))
+        session_key_header = str(headers.get('X-Hermes-Session-Key', ''))
+
+        if 'openwebui:' not in session_header and 'openwebui:' not in session_key_header:
+            continue
+
+        delete_base = _derive_hermes_session_delete_url(base_url)
+        if not delete_base or delete_base in seen:
+            continue
+
+        seen.add(delete_base)
+        targets.append((delete_base, api_keys[idx]))
+
+    return targets
+
+
+async def _delete_hermes_session_for_chat(request: Request, chat_id: str) -> None:
+    session_id = f'openwebui:{chat_id}'
+    targets = _iter_hermes_api_targets(request)
+
+    if not targets:
+        log.warning(
+            'Hermes cleanup skipped for chat %s, no matching OpenAI backend with openwebui session headers found.',
+            chat_id,
+        )
+        return
+
+    timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
+
+    for delete_base, api_key in targets:
+        url = f"{delete_base}/{quote(session_id, safe='')}"
+        headers = {'Accept': 'application/json'}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.delete(url, headers=headers) as response:
+                    if response.status in (200, 202, 204, 404):
+                        log.info(
+                            'Hermes cleanup for chat %s via %s returned %s',
+                            chat_id,
+                            delete_base,
+                            response.status,
+                        )
+                    else:
+                        body = await response.text()
+                        log.warning(
+                            'Hermes cleanup for chat %s via %s failed with %s: %s',
+                            chat_id,
+                            delete_base,
+                            response.status,
+                            body[:500],
+                        )
+        except Exception:
+            log.exception('Hermes cleanup request crashed for chat %s via %s', chat_id, delete_base)
+
+
+async def _delete_hermes_sessions_for_chat_ids(request: Request, chat_ids: list[str]) -> None:
+    for chat_id in chat_ids:
+        await _delete_hermes_session_for_chat(request, chat_id)
 
 ############################
 # GetChatList
@@ -503,7 +596,13 @@ async def delete_all_user_chats(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
+    chats = await Chats.get_chat_list_by_user_id(user.id, include_archived=True, db=db)
+    chat_ids = [chat.id for chat in chats]
+
     result = await Chats.delete_chats_by_user_id(user.id, db=db)
+    if result and chat_ids:
+        await _delete_hermes_sessions_for_chat_ids(request, chat_ids)
+
     return result
 
 
@@ -1135,6 +1234,8 @@ async def delete_chat_by_id(
         await Chats.delete_orphan_tags_for_user(chat.meta.get('tags', []), user.id, threshold=1, db=db)
 
         result = await Chats.delete_chat_by_id(id, db=db)
+        if result:
+            await _delete_hermes_session_for_chat(request, id)
 
         return result
     else:
@@ -1153,6 +1254,8 @@ async def delete_chat_by_id(
         await Chats.delete_orphan_tags_for_user(chat.meta.get('tags', []), user.id, threshold=1, db=db)
 
         result = await Chats.delete_chat_by_id_and_user_id(id, user.id, db=db)
+        if result:
+            await _delete_hermes_session_for_chat(request, id)
         return result
 
 
